@@ -190,6 +190,8 @@ class MockEngine:
         self.on_status: StatusCB | None = None
         self._turns: dict[str, int] = {}
         self._tasks: set[asyncio.Task] = set()
+        self._locks: dict[str, asyncio.Lock] = {}  # dsh 对同一会话的 turn 是串行的，这里也串行
+        self._queued: dict[str, int] = {}          # 还没跑完的 prompt 数；dsh 只在 inbox 排空后才报 idle
 
     async def start(self) -> None:
         pass
@@ -202,7 +204,17 @@ class MockEngine:
         return True
 
     async def prompt(self, session_id: str, text: str) -> None:
-        t = asyncio.create_task(self._run(session_id, text))
+        self._queued[session_id] = self._queued.get(session_id, 0) + 1
+
+        async def serialized() -> None:
+            async with self._locks.setdefault(session_id, asyncio.Lock()):
+                try:
+                    await self._run(session_id, text)
+                finally:
+                    self._queued[session_id] -= 1
+                    if self._queued[session_id] == 0 and self.on_status:
+                        await self.on_status(session_id, "idle")
+        t = asyncio.create_task(serialized())
         self._tasks.add(t)
         t.add_done_callback(self._tasks.discard)
 
@@ -220,31 +232,66 @@ class MockEngine:
         return result
 
     async def _run(self, sid: str, text: str) -> None:
-        n = self._turns[sid] = self._turns.get(sid, 0) + 1
+        lower = text.lower()
+        is_notice = "subtask task_" in lower and "finished with status" in lower   # 子任务结束通知
+        is_chat = "message from the human" in lower or is_notice
+        is_child = "subtask of parent" in lower
+        if is_chat:
+            n = self._turns.get(sid, 0)          # 插话不消耗剧本进度
+        else:
+            n = self._turns[sid] = self._turns.get(sid, 0) + 1
         if self.on_status:
             await self.on_status(sid, "running")
         await self._emit(sid, "user/message", {"message": {"role": "user", "content": [{"type": "text", "text": text}]}})
         await asyncio.sleep(self.delay)
         try:
-            if n == 1:
-                await self._say(sid, "收到任务。先发布计划。")
-                await self._call(sid, "muse_plan", task_id=sid, steps=["拉取财务数据", "计算因子", "撰写报告", "提交回执"])
+            if is_notice:
+                await self._say(sid, "收到子任务结论，已并入分析。")
+            elif is_chat and n < 3:
+                await self._say(sid, "收到，我会在后续步骤里一并处理。")
+            elif is_child:
+                # 子任务剧本：一轮做完
+                await self._call(sid, "muse_plan", task_id=sid, steps=["取数", "结论"], done=2)
+                await self._call(sid, "muse_receipt", task_id=sid, kind="data", path=f"data/{sid}.json", summary="子任务取数完成")
+                await self._say(sid, "子任务结论：样本内动量因子 IC 0.04，显著。")
+            elif is_chat:
+                # 插话 / 重开：回应一句，顺手展示一张表
+                await self._say(sid, "收到你的消息，我补一张对比表。")
+                await self._call(sid, "muse_show_table", task_id=sid, title="追加对比", columns=["指标", "600519", "行业均值"],
+                                 rows=[["PE(TTM)", 26.5, 31.2], ["ROE", "6.03%", "9.8%"]], note="数据来源：demo-offline")
+            elif n == 1:
+                await self._say(sid, "收到任务。先发布计划，再拉数据。")
+                await self._call(sid, "muse_plan", task_id=sid, steps=["拉取行情与财务", "计算因子", "撰写报告", "提交回执"])
                 await asyncio.sleep(self.delay)
-                await self._emit(sid, "tool/call", {"name": "bash", "arguments": '{"command":"python scripts/fetch_fin.py 600519"}'})
-                await self._emit(sid, "tool/result", {"name": "bash", "content": [{"type": "text", "text": "data source error: simulated outage"}]})
-                await self._call(sid, "muse_request_input", task_id=sid, question="主数据源不可用，换备用源还是稍后重试？", options=["换备用源", "稍后重试"])
+                await self._emit(sid, "tool/call", {"callId": "c1", "name": "bash", "arguments": '{"command":"python scripts/fetch_fin.py 600519"}'})
+                await self._emit(sid, "tool/result", {"message": {"callId": "c1", "role": "tool", "content": [{"type": "text", "text": "wrote data/600519/financials.json (demo-offline, 6 quarters)"}]}})
+                await self._call(sid, "muse_show_chart", task_id=sid, title="近 6 季营收与净利（亿元）", chart_type="bar",
+                                 x=["25Q1", "25Q2", "25Q3", "25Q4", "26Q1", "26Q2"],
+                                 series=[{"name": "营收", "values": [98, 104, 110, 121, 118, 129]}, {"name": "净利", "values": [21, 24, 19, 26, 14, 12]}],
+                                 note="数据来源：demo-offline")
+                await self._call(sid, "muse_memory_set", task_id=sid, key="demo.last_code", value="600519")
+                await self._call(sid, "muse_request_input", task_id=sid, question="净利连续两季下滑，报告口径按哪种？",
+                                 options=["保守", "中性"],
+                                 fields=[{"name": "horizon", "label": "研究周期", "type": "choice", "options": ["3个月", "6个月", "12个月"]},
+                                         {"name": "focus", "label": "重点关注", "type": "text", "required": False}])
                 await self._say(sid, "已记录问题，等待回答后继续。")
             elif n == 2:
-                await self._say(sid, f"收到回答：{text[:40]}。继续拉数据并计算因子。")
-                await self._call(sid, "muse_plan", task_id=sid, steps=["拉取财务数据", "计算因子", "撰写报告", "提交回执"], done=2)
+                await self._say(sid, "收到回答。继续计算因子，并派一个子任务做因子显著性检验。")
+                await self._call(sid, "muse_plan", task_id=sid, steps=["拉取行情与财务", "计算因子", "撰写报告", "提交回执"], done=2)
+                await self._call(sid, "muse_show_table", task_id=sid, title="因子表", columns=["因子", "数值", "窗口"],
+                                 rows=[["revenue_yoy", "23.74%", "25Q2→26Q2"], ["net_profit_yoy", "-48.26%", "25Q2→26Q2"], ["pe_ttm", "26.5x", "TTM"]],
+                                 note="数据来源：demo-offline")
+                await self._call(sid, "muse_spawn_subtask", task_id=sid, title="动量因子显著性检验", prompt="subtask of parent: 检验动量因子 IC")
+                await self._call(sid, "muse_library_add", task_id=sid, title="600519 因子快照", summary="营收同比 +23.7%，净利同比 -48.3%，PE 26.5x", tags=["600519", "因子"])
                 await self._call(sid, "muse_request_approval", task_id=sid, action="send_report", payload='{"to":"pm@fund.example","subject":"600519 研究报告"}', reason="报告写完后需要外发给基金经理")
                 await self._say(sid, "已申请外发审批，等待结果。")
             else:
                 approved = "approved" in text.lower() or "批准" in text
                 await self._say(sid, "审批结果已收到。" + ("将在验收后外发。" if approved else "不外发，仅保存本地。"))
+                await self._call(sid, "muse_attach_file", task_id=sid, path="reports/600519.md", title="600519 研究报告", kind="report")
+                await self._call(sid, "muse_show_markdown", task_id=sid, title="结论摘要", markdown="**中性**。营收同比 +23.7%，净利同比 -48.3%。\n\n- 盈利质量下滑\n- 估值合理")
                 await self._call(sid, "muse_receipt", task_id=sid, kind="report", path="reports/600519.md", summary="中性。营收同比 +23.7%，净利同比 -48.3%，盈利质量下滑但估值合理。", meta='{"source":"demo-offline","window":"2025Q2→2026Q2"}')
-                await self._call(sid, "muse_plan", task_id=sid, steps=["拉取财务数据", "计算因子", "撰写报告", "提交回执"], done=4)
+                await self._call(sid, "muse_plan", task_id=sid, steps=["拉取行情与财务", "计算因子", "撰写报告", "提交回执"], done=4)
                 await self._say(sid, "任务完成：报告位于 reports/600519.md，结论中性。")
         finally:
-            if self.on_status:
-                await self.on_status(sid, "idle")
+            pass  # idle 由 prompt() 的串行包装在队列排空后统一发出

@@ -36,9 +36,9 @@ TRANSITIONS: dict[Status, set[Status]] = {
     Status.waiting_input: {Status.running, Status.cancelled, Status.interrupted},
     Status.waiting_approval: {Status.running, Status.cancelled, Status.interrupted},
     Status.interrupted: {Status.queued, Status.cancelled, Status.failed},
-    Status.review: {Status.done, Status.queued, Status.cancelled},   # 验收不通过可以打回重跑
-    Status.failed: {Status.queued, Status.cancelled},                # 失败可重试
-    Status.done: set(),
+    Status.review: {Status.done, Status.queued, Status.cancelled, Status.running},   # 打回重跑，或聊天中重开
+    Status.failed: {Status.queued, Status.cancelled, Status.running},
+    Status.done: {Status.running},                                   # 聊天继续 = 重开
     Status.cancelled: set(),
 }
 
@@ -59,6 +59,8 @@ class Task(BaseModel):
     max_retries: int = 1
     retries: int = 0
     session_id: str = ""  # dsh 会话 id；有它就能从断点恢复
+    parent_id: str = ""   # 子任务指向父任务；父任务在子任务结束时收到通知
+    schedule_id: str = ""  # 由定时计划创建的任务
     workspace: str = ""
     plan: list[PlanStep] = Field(default_factory=list)
     error: str = ""
@@ -69,11 +71,20 @@ class Task(BaseModel):
     finished_at: datetime | None = None
 
 
+class FormField(BaseModel):
+    name: str
+    label: str
+    type: str = "text"  # text | number | date | choice | multichoice
+    options: list[str] = Field(default_factory=list)
+    required: bool = True
+
+
 class InputRequest(BaseModel):
     id: str
     task_id: str
     question: str
     options: list[str] = Field(default_factory=list)
+    fields: list[FormField] = Field(default_factory=list)  # 非空则渲染成表单，answer 为 JSON
     answer: str = ""
     created_at: datetime
     answered_at: datetime | None = None
@@ -109,7 +120,40 @@ class Event(BaseModel):
     created_at: datetime
 
 
+class MemoryItem(BaseModel):
+    key: str
+    value: str
+    task_id: str = ""
+    updated_at: datetime
+
+
+class LibraryItem(BaseModel):
+    id: str
+    task_id: str
+    title: str
+    summary: str
+    path: str = ""
+    tags: list[str] = Field(default_factory=list)
+    created_at: datetime
+
+
+class Schedule(BaseModel):
+    id: str
+    title: str
+    prompt: str
+    skill: str = ""
+    every: str          # "30m" | "2h" | "daily 09:30" | "weekdays 09:30"
+    enabled: bool = True
+    next_run_at: datetime
+    last_task_id: str = ""
+    created_by_task: str = ""
+    created_at: datetime
+
+
 # ---- API 请求体 ----
+
+class SayBody(BaseModel):
+    text: str
 
 class TaskCreate(BaseModel):
     title: str

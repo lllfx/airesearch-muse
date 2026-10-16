@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 
 from .board import Board, IllegalTransition
-from .models import AnswerBody, DecisionBody, Status, TaskCreate, TaskDetail, TaskUpdate
+from .models import AnswerBody, DecisionBody, SayBody, Status, TaskCreate, TaskDetail, TaskUpdate
 from .runner import Runner
 
 log = logging.getLogger("muse.api")
@@ -115,6 +115,94 @@ def accept(task_id: str, b: Board = Depends(board)):
         _404(e)
     except IllegalTransition as e:
         raise HTTPException(409, str(e))
+
+
+@router.post("/tasks/{task_id}/say")
+async def say(task_id: str, body: SayBody, r: Runner = Depends(runner)):
+    """聊天框发消息。任何状态都可以发；进行中就插话，结束了就重开。"""
+    if not body.text.strip():
+        raise HTTPException(400, "empty message")
+    try:
+        return await r.say(task_id, body.text.strip())
+    except KeyError as e:
+        _404(e)
+    except IllegalTransition as e:
+        raise HTTPException(409, str(e))
+
+
+@router.get("/tasks/{task_id}/children")
+def children(task_id: str, b: Board = Depends(board)):
+    return b.store.list_children(task_id)
+
+
+# ---------- 跨任务：记忆 / 资料库 / 定时 ----------
+
+@router.get("/memory")
+def memory_list(prefix: str = "", b: Board = Depends(board)):
+    return b.store.memory_list(prefix)
+
+
+@router.put("/memory/{key}")
+def memory_put(key: str, body: dict, b: Board = Depends(board)):
+    return b.memory_set(key, str(body.get("value", "")))
+
+
+@router.delete("/memory/{key}", status_code=204)
+def memory_delete(key: str, b: Board = Depends(board)):
+    b.store.memory_delete(key)
+
+
+@router.get("/library")
+def library(q: str = "", limit: int = 50, b: Board = Depends(board)):
+    return b.store.library_search(q, limit) if q else b.store.library_list(limit)
+
+
+@router.delete("/library/{item_id}", status_code=204)
+def library_delete(item_id: str, b: Board = Depends(board)):
+    b.store.library_delete(item_id)
+
+
+@router.get("/schedules")
+def schedules(b: Board = Depends(board)):
+    return b.store.schedule_list()
+
+
+@router.post("/schedules", status_code=201)
+def schedule_create(body: dict, b: Board = Depends(board)):
+    try:
+        return b.schedule_create(body["title"], body["prompt"], body.get("skill", ""), body["every"])
+    except (KeyError, ValueError) as e:
+        raise HTTPException(400, str(e))
+
+
+@router.post("/schedules/{sid}/toggle")
+def schedule_toggle(sid: str, b: Board = Depends(board)):
+    for sch in b.store.schedule_list():
+        if sch.id == sid:
+            sch.enabled = not sch.enabled
+            b.store.schedule_update(sch)
+            b.bus.publish("schedule", sch.model_dump(mode="json"))
+            return sch
+    raise HTTPException(404, "schedule not found")
+
+
+@router.delete("/schedules/{sid}", status_code=204)
+def schedule_delete(sid: str, b: Board = Depends(board)):
+    b.store.schedule_delete(sid)
+    b.bus.publish("schedule_deleted", {"id": sid})
+
+
+@router.get("/skills")
+def skills(req: Request):
+    """扫描 dsh/skills，给新任务表单用。"""
+    import re
+    out = []
+    root = Path(req.app.state.settings.skill_dir)
+    for md in sorted(root.glob("*/SKILL.md")):
+        text = md.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"^description:\s*(.+)$", text, re.M)
+        out.append({"name": md.parent.name, "description": (m.group(1).strip().strip('"') if m else "")[:200]})
+    return out
 
 
 @router.post("/input-requests/{req_id}/answer")

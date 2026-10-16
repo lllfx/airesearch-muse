@@ -13,6 +13,7 @@ from .api import router
 from .board import Board, EventBus
 from .config import Settings, settings
 from .engine import DshEngine, MockEngine
+from .iwencai import IwencaiClient
 from .mcp_tools import build_mcp
 from .runner import Runner
 from .store import Store
@@ -24,9 +25,11 @@ def create_app(cfg: Settings = settings) -> FastAPI:
     store = Store(cfg.db_path)
     bus = EventBus()
     board = Board(store, bus)
-    mcp, tools = build_mcp(board)
+    iwencai = IwencaiClient.from_env(cfg.workspace)
+    mcp, tools = build_mcp(board, iwencai)
     engine = MockEngine(tools) if cfg.engine == "mock" else DshEngine(cfg)
     runner = Runner(board, engine, cfg)
+    tools.runner = runner
     # 挂在 /mcp 下，所以内部路径设为根；无状态 + JSON 响应，dsh 的 mcp-client 两种都支持
     mcp_app = mcp.streamable_http_app(streamable_http_path="/", stateless_http=True, json_response=True)
 

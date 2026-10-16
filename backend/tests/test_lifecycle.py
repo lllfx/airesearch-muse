@@ -58,9 +58,10 @@ async def test_full_lifecycle(tmp_path):
     r = await client.post(f"/api/action-reviews/{d['action_reviews'][0]['id']}/decide", json={"decision": "approved", "comment": "ok"})
     assert r.status_code == 200
     d = await wait_status(client, tid, "review")
-    assert len(d["receipts"]) == 1 and d["receipts"][0]["path"] == "reports/600519.md"
+    assert any(r["kind"] == "report" and r["path"] == "reports/600519.md" for r in d["receipts"])
     assert all(s["status"] == "done" for s in d["task"]["plan"])
-    assert "中性" in d["task"]["summary"]
+    evs = (await client.get(f"/api/tasks/{tid}/events")).json()
+    assert any("中性" in e["payload"].get("text", "") for e in evs if e["kind"] == "session/assistant")
 
     # 验收 → done
     r = await client.post(f"/api/tasks/{tid}/accept")

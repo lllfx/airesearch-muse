@@ -12,7 +12,9 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from .board import Board, IllegalTransition
+import json
+
+from .board import Board, IllegalTransition, next_run
 from .config import Settings
 from .engine import Engine, EngineError
 from .models import Status, Task
@@ -29,6 +31,9 @@ class Runner:
         self.engine.on_status = self._on_status
         self._wake = asyncio.Event()
         self._loop_task: asyncio.Task | None = None
+        self._sched_task: asyncio.Task | None = None
+        # 任务还没启动时收到的聊天消息，启动后紧跟初始 prompt 发出
+        self._pending_say: dict[str, list[str]] = {}
 
     # ---------- 生命周期 ----------
 
@@ -36,11 +41,13 @@ class Runner:
         self._recover_after_restart()
         await self.engine.start()
         self._loop_task = asyncio.create_task(self._dispatch_loop(), name="runner-dispatch")
+        self._sched_task = asyncio.create_task(self._schedule_loop(), name="runner-schedule")
         self._wake.set()
 
     async def stop(self) -> None:
-        if self._loop_task:
-            self._loop_task.cancel()
+        for t in (self._loop_task, self._sched_task):
+            if t:
+                t.cancel()
         await self.engine.stop()
 
     def _recover_after_restart(self) -> None:
@@ -87,6 +94,8 @@ class Runner:
         text = self._continue_prompt(t) if resumed else self._initial_prompt(t)
         try:
             await self.engine.prompt(t.session_id, text)
+            for extra in self._pending_say.pop(t.id, []):
+                await self.engine.prompt(t.session_id, f"Task id: {t.id}. Message from the human: {extra}")
         except EngineError as e:
             self.board.transition(t, Status.failed, note="prompt failed", error=str(e))
 
@@ -121,6 +130,82 @@ class Runner:
             await self.engine.prompt(t.session_id, f"Task id: {t.id}. Decision on action '{rev.action}' ({rev.id}): {verdict}.{extra}\nContinue the task.")
         return self.board.task(t.id)
 
+    async def say(self, task_id: str, text: str) -> Task:
+        """聊天框里的消息。按任务当前状态决定怎么送达：
+
+        running           → 直接 prompt，dsh 在当前轮结束后作为下一轮处理（插话）
+        waiting_input     → 当作对未决问题的回答
+        waiting_approval  → 记录并 prompt，决定做出后 agent 会看到
+        review/done/failed/interrupted → 重开：转 running 再 prompt
+        backlog/queued    → 先存着，任务启动后紧跟初始 prompt 发出
+        """
+        t = self.board.task(task_id)
+        self.board.user_message(t.id, text)
+        if t.status == Status.waiting_input:
+            req = self.board.store.pending_input_request(t.id)
+            if req:
+                return await self.answer(req.id, text)
+        if t.status in (Status.backlog, Status.queued):
+            self._pending_say.setdefault(t.id, []).append(text)
+            if t.status == Status.backlog:
+                self.board.transition(t, Status.queued, note="message from human")
+                self.wake()
+            return self.board.task(t.id)
+        if t.status in (Status.review, Status.done, Status.failed, Status.interrupted):
+            if t.status == Status.interrupted and t.session_id:
+                await self.engine.resume(t.session_id)
+            self.board.transition(t, Status.running, note="reopened by message")
+        elif t.status == Status.cancelled:
+            raise IllegalTransition("cancelled task cannot be messaged; create a new task")
+        await self.engine.prompt(t.session_id or t.id, f"Task id: {t.id}. Message from the human: {text}")
+        return self.board.task(t.id)
+
+    async def _notify_parent(self, child: Task) -> None:
+        """子任务结束：把结论和回执作为消息送给父任务。父任务空闲就重开，在跑就插话。"""
+        if not child.parent_id:
+            return
+        parent = self.board.store.get_task(child.parent_id)
+        if not parent or parent.status in (Status.cancelled,):
+            return
+        receipts = self.board.store.list_receipts(child.id)
+        lines = [f"Subtask {child.id} '{child.title}' finished with status {child.status.value}."]
+        if child.summary:
+            lines.append(f"Conclusion: {child.summary[:1500]}")
+        for r in receipts:
+            lines.append(f"- receipt [{r.kind}] {r.summary}" + (f" ({r.path})" if r.path else ""))
+        if child.error:
+            lines.append(f"Error: {child.error}")
+        text = "\n".join(lines)
+        self.board.store.append_event(parent.id, "board/subtask", {"id": child.id, "title": child.title, "status": child.status.value, "summary": child.summary[:300]})
+        self.board.bus.publish("task", parent.model_dump(mode="json"))
+        try:
+            if parent.status in (Status.review, Status.done, Status.failed, Status.interrupted):
+                self.board.transition(parent, Status.running, note=f"subtask {child.id} finished")
+            if parent.status in (Status.running, Status.waiting_approval, Status.waiting_input):
+                await self.engine.prompt(parent.session_id or parent.id, f"Task id: {parent.id}. {text}")
+            else:
+                self._pending_say.setdefault(parent.id, []).append(text)
+        except (EngineError, IllegalTransition) as e:
+            log.warning("notify parent %s failed: %s", parent.id, e)
+
+    async def _schedule_loop(self) -> None:
+        while True:
+            try:
+                now = datetime.now(timezone.utc)
+                for sch in self.board.store.schedule_due(now):
+                    t = self.board.store.create_task(title=f"{sch.title} · {now.astimezone():%m-%d %H:%M}", prompt=sch.prompt, skill=sch.skill,
+                                                     requires_review=True, schedule_id=sch.id, status=Status.queued)
+                    sch.last_task_id = t.id
+                    sch.next_run_at = next_run(sch.every, now)
+                    self.board.store.schedule_update(sch)
+                    self.board.store.append_event(t.id, "board/status", {"from": "backlog", "to": "queued", "note": f"schedule {sch.id}"})
+                    self.board.bus.publish("task", t.model_dump(mode="json"))
+                    self.board.bus.publish("schedule", sch.model_dump(mode="json"))
+                    self.wake()
+            except Exception:  # noqa: BLE001
+                log.exception("schedule loop failed")
+            await asyncio.sleep(30)
+
     # ---------- 引擎回调 ----------
 
     async def _on_event(self, session_id: str, event: dict) -> None:
@@ -146,8 +231,10 @@ class Runner:
             self.board.transition(t, Status.waiting_approval)
         elif t.requires_review:
             self.board.transition(t, Status.review, note="agent finished")
+            await self._notify_parent(self.board.task(t.id))
         else:
             self.board.transition(t, Status.done, note="agent finished")
+            await self._notify_parent(self.board.task(t.id))
 
     def _fail_or_retry(self, t: Task, err: str) -> None:
         if t.retries < t.max_retries:
@@ -157,3 +244,4 @@ class Runner:
             self.wake()
         else:
             self.board.transition(t, Status.failed, error=err)
+            asyncio.create_task(self._notify_parent(self.board.task(t.id)))

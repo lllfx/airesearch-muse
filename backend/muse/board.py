@@ -4,9 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 
-from .models import TRANSITIONS, ActionReview, InputRequest, PlanStep, Receipt, Status, Task
+from .models import TRANSITIONS, ActionReview, FormField, InputRequest, LibraryItem, MemoryItem, PlanStep, Receipt, Schedule, Status, Task
 from .store import Store
 
 log = logging.getLogger("muse.board")
@@ -88,10 +89,15 @@ class Board:
                     t.summary = text[:2000]
                     self.store.save_task(t)
         elif etype == "tool/call":
-            self._event(task_id, "session/tool_call", {"name": data.get("name"), "arguments": _short(data.get("arguments"))})
+            self._event(task_id, "session/tool_call", {"call_id": data.get("callId"), "name": data.get("name"),
+                                                       "arguments": _short(data.get("arguments"), 2000)})
         elif etype == "tool/result":
             msg = data.get("message") or data
-            self._event(task_id, "session/tool_result", {"name": data.get("name"), "text": _short(_text_of(msg)), "error": bool(data.get("error") or msg.get("isError"))})
+            self._event(task_id, "session/tool_result", {"call_id": msg.get("callId") or data.get("callId"), "name": data.get("name"),
+                                                         "text": _short(_text_of(msg), 2000), "error": bool(data.get("error") or msg.get("isError"))})
+        elif etype == "user/message":
+            # 由看板发出的消息已经记过 board/user_message；这里只收 dsh 自己注入的上下文，略过
+            pass
         elif etype == "turn/end":
             self._event(task_id, "session/turn_end", {"reason": data.get("reason")})
         elif etype in ("compaction/summary", "llm/retry"):
@@ -111,9 +117,9 @@ class Board:
         self.bus.publish("task", t.model_dump(mode="json"))
         return t
 
-    def request_input(self, task_id: str, question: str, options: list[str] | None) -> InputRequest:
+    def request_input(self, task_id: str, question: str, options: list[str] | None, fields: list[FormField] | None = None) -> InputRequest:
         t = self.task(task_id)
-        req = self.store.create_input_request(task_id, question, options)
+        req = self.store.create_input_request(task_id, question, options, fields)
         self._event(task_id, "board/input_requested", req.model_dump(mode="json"))
         if t.status == Status.running:
             self.transition(t, Status.waiting_input, note=req.id)
@@ -136,7 +142,47 @@ class Board:
         self.bus.publish("receipt", r.model_dump(mode="json"))
         return r
 
+    def card(self, task_id: str, card: dict) -> None:
+        """富媒体卡片（table / chart / file / markdown）。只进时间线，由前端渲染。"""
+        self.task(task_id)
+        self._event(task_id, "board/card", card)
+
+    def spawn_subtask(self, parent_id: str, title: str, prompt: str, skill: str = "") -> Task:
+        parent = self.task(parent_id)
+        child = self.store.create_task(title=title, prompt=prompt, skill=skill, priority=parent.priority,
+                                       requires_review=False, max_retries=parent.max_retries, parent_id=parent.id, status=Status.queued)
+        self._event(parent.id, "board/subtask", {"id": child.id, "title": child.title, "status": child.status.value})
+        self._event(child.id, "board/status", {"from": "backlog", "to": "queued", "note": f"spawned by {parent.id}"})
+        self.bus.publish("task", child.model_dump(mode="json"))
+        return child
+
+    # ---------- 跨任务：记忆 / 资料库 / 定时 ----------
+
+    def memory_set(self, key: str, value: str, task_id: str = "") -> MemoryItem:
+        it = self.store.memory_set(key, value, task_id)
+        if task_id:
+            self._event(task_id, "board/memory", {"key": key, "value": _short(value, 300)})
+        self.bus.publish("memory", it.model_dump(mode="json"))
+        return it
+
+    def library_add(self, task_id: str, title: str, summary: str, path: str = "", tags: list[str] | None = None) -> LibraryItem:
+        it = self.store.library_add(task_id, title, summary, path, tags)
+        self._event(task_id, "board/library", it.model_dump(mode="json"))
+        self.bus.publish("library", it.model_dump(mode="json"))
+        return it
+
+    def schedule_create(self, title: str, prompt: str, skill: str, every: str, created_by_task: str = "") -> Schedule:
+        nxt = next_run(every, datetime.now(timezone.utc))
+        sch = self.store.schedule_create(title, prompt, skill, every, nxt, created_by_task)
+        if created_by_task:
+            self._event(created_by_task, "board/schedule", {"id": sch.id, "title": title, "every": every})
+        self.bus.publish("schedule", sch.model_dump(mode="json"))
+        return sch
+
     # ---------- 人侧动作（REST 进来） ----------
+
+    def user_message(self, task_id: str, text: str) -> None:
+        self._event(task_id, "board/user_message", {"text": text})
 
     def answer(self, req_id: str, answer: str) -> tuple[Task, InputRequest]:
         req = self.store.answer_input_request(req_id, answer)
@@ -165,3 +211,26 @@ def _text_of(msg: dict) -> str:
 def _short(v, n: int = 600) -> str:
     s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str)
     return s if len(s) <= n else s[:n] + f"… (+{len(s) - n} chars)"
+
+
+_EVERY_RE = re.compile(r"^(\d+)\s*([mh])$")
+
+
+def next_run(every: str, after: datetime) -> datetime:
+    """支持四种写法：'30m' / '2h' / 'daily 09:30' / 'weekdays 09:30'（时间按本机时区）。"""
+    every = every.strip().lower()
+    m = _EVERY_RE.match(every)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        if n <= 0:
+            raise ValueError("interval must be positive")
+        return after + timedelta(minutes=n if unit == "m" else n * 60)
+    parts = every.split()
+    if len(parts) == 2 and parts[0] in ("daily", "weekdays"):
+        hh, mm = (int(x) for x in parts[1].split(":"))
+        local = after.astimezone()
+        cand = local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        while cand <= local or (parts[0] == "weekdays" and cand.weekday() >= 5):
+            cand += timedelta(days=1)
+        return cand.astimezone(timezone.utc)
+    raise ValueError("every must be like '30m', '2h', 'daily 09:30' or 'weekdays 09:30'")
