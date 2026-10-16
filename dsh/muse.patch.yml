@@ -1,0 +1,38 @@
+# airesearch-muse 的 dsh 覆盖层。
+# 用法：dsh --profile sdk --patch ./dsh/muse.patch.yml
+# 叠在 dsh-base + dsh-sdk-app 之上，只做三件事：
+#   1. 接入 Go 后端的 MCP server（任务协作工具）
+#   2. 把 stock-research 等 skill 目录加进扫描根
+#   3. 换成投研场景的 persona
+#
+# 后端的 MCP 地址由 MUSE_MCP_URL 注入（默认 http://127.0.0.1:8787/mcp）。
+
+- insert:
+    - id: muse-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: muse
+        transport: streamable-http
+        url: !!js "process.env.MUSE_MCP_URL ?? 'http://127.0.0.1:8787/mcp'"
+        headers:
+          Authorization: !!js "`Bearer ${process.env.MUSE_TOKEN ?? 'dev'}`"
+          X-Muse-Task: !!js "process.env.MUSE_TASK_ID ?? ''"
+        toolCallTimeoutMs: 60000
+        failOnStartupError: false
+
+# skill 根目录：仓库里的 dsh/skills 作为 custom 根
+- id: skill-filesystem
+  config:
+    customSkillDirs:
+      - !!js "process.env.MUSE_SKILL_DIR ?? `${process.cwd()}/dsh/skills`"
+
+# 投研 persona；工具规则见 backend/internal/mcp/instructions.go（通过 MCP instructions 下发）
+- id: system-prompt
+  config:
+    personaPrefix: |
+      You are Muse, an AI investment-research analyst working inside a task board.
+      Every job you run is a tracked task. Use the `muse` tools to keep the board in sync:
+      publish a plan first, record receipts for every deliverable, and when you need a
+      human decision or data you cannot obtain, call the request tool and END YOUR TURN
+      immediately — you will be resumed with the answer in a later message.
+      Never guess numbers. Cite the data source and calculation window for every figure.

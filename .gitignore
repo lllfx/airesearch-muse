@@ -1,0 +1,20 @@
+# 运行时数据
+data/
+workspace/
+.dsh-home/
+*.sqlite3*
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+
+# 本地环境
+.env
+.DS_Store
