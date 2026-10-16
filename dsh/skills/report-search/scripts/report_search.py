@@ -11,6 +11,12 @@ import urllib.request
 from pathlib import Path
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _iwencai_env import load_iwencai_env  # noqa: E402
+
+load_iwencai_env()
+
+
 SKILL_ID = "report-search"
 SKILL_VERSION = "1.0.0"
 DEFAULT_BASE_URL = "https://openapi.iwencai.com"

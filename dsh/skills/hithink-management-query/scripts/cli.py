@@ -19,7 +19,14 @@ import secrets
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Optional, Union
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _iwencai_env import load_iwencai_env  # noqa: E402
+
+load_iwencai_env()
 
 
 SKILL_NAME = "hithink-management-query"
