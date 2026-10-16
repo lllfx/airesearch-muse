@@ -20,6 +20,22 @@
         toolCallTimeoutMs: 60000
         failOnStartupError: false
 
+# OpenAI Chat Completions 兼容中转站。
+# 密钥、地址和模型名只从 .env 注入，不写进版本库配置。
+- id: llm-pi-ai
+  config:
+    providers:
+      openai-relay:
+        displayName: OpenAI Relay
+        apiKeyEnv: OPENAI_API_KEY
+        api: openai-completions
+        baseURL: !!js "process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1'"
+        defaultContextWindow: 128000
+        defaultMaxTokens: 16384
+        models:
+          - id: !!js "process.env.MUSE_MODEL ?? 'gpt-4o'"
+            name: !!js "process.env.MUSE_MODEL ?? 'gpt-4o'"
+
 # skill 根目录：仓库里的 dsh/skills 作为 custom 根
 - id: skill-filesystem
   config:

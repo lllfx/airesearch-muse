@@ -29,7 +29,9 @@ class Settings:
 
     @property
     def mcp_url(self) -> str:
-        return f"http://{self.host}:{self.port}/mcp"
+        # Starlette mounts the MCP ASGI app below /mcp; the streamable HTTP
+        # endpoint itself is "/", so clients must retain the trailing slash.
+        return f"http://{self.host}:{self.port}/mcp/"
 
 
 settings = Settings()
